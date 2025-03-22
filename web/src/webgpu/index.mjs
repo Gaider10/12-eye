@@ -8,7 +8,7 @@ const device = await adapter.requestDevice({ requiredLimits: { maxComputeWorkgro
 console.log("GPU Device:", device);
 
 // #if false
-const wgsl = await fetch("/webgpu/main.wgsl").then((response) => response.text());
+const wgsl = await fetch(new URL("./main.wgsl", import.meta.url)).then((response) => response.text());
 // #else
 // #code import wgsl from './main.wgsl';
 // #endif
