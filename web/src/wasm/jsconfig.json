@@ -1,0 +1,11 @@
+{
+    "extends": "../../jsconfig.json",
+    "include": [
+        "./worker.mjs"
+    ],
+    "compilerOptions": {
+        "lib": [
+            "WebWorker"
+        ],
+    }
+}

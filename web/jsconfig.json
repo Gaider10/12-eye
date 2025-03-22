@@ -1,0 +1,15 @@
+{
+  "include": [
+    "src/**/*"
+  ],
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "types": [
+      "@webgpu/types",
+      "@types/emscripten"
+    ],
+    "checkJs": true,
+    "strictNullChecks": true
+  }
+}

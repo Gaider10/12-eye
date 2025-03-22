@@ -1,0 +1,28 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    height: 100vh;
+    margin: 0;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+}
+
+input[type=number] {
+    width: 40px;
+}
+
+#input-start-seed {
+    width: 160px;
+}
+
+#input-print-interval {
+    width: 80px;
+}
+
+
+#div-log {
+    overflow: auto;
+}

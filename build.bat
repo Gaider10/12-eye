@@ -1,0 +1,2 @@
+#!/bin/sh
+nvcc src/12eye.cu src/lib.cpp src/stronghold_generator/BoundingBox.cpp src/stronghold_generator/Piece.cpp src/stronghold_generator/PiecePlaceCount.cpp src/stronghold_generator/PieceWeight.cpp src/stronghold_generator/StrongholdGenerator.cpp src/stronghold_generator/XrsrRandom.cpp cubiomes/biomenoise.c cubiomes/biomes.c cubiomes/finders.c cubiomes/generator.c cubiomes/layers.c cubiomes/noise.c -o main -O2 -arch=native --generate-line-info

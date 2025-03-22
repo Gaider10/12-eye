@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <!--
+        // #if false
+        -->
+        <link rel="stylesheet" href="style.css">
+        <script src="main.js" type="module"></script>
+        <!--
+        // #endif
+        -->
+    </head>
+    <body>
+        <div>
+            <button id="bench-layout-button">Bench Layout</button>
+            <button id="bench-biomes-button">Bench Biomes</button>
+            <br>
+            <button id="run-gpu-button">Run GPU</button>
+            <label>
+                Start structure seed:
+                <input type="number" id="input-start-seed">
+            </label>
+            <label>
+                Bits per iteration:
+                <input type="number" id="input-bits-per-iter">
+            </label>
+            <label>
+                Workers:
+                <input type="number" id="input-workers">
+            </label>
+            <label>
+                Ranges:
+                <input type="number" id="input-ranges-size">
+                <input type="number" id="input-ranges-count">
+            </label>
+            <button id="stop-gpu-button" disabled>Stop</button>
+            <br>
+            <label>
+                Print interval:
+                <input type="number" id="input-print-interval">
+            </label>
+        </div>
+        <br>
+        <div id="div-status"></div>
+        <br>
+        <div id="div-log"></div>
+    </body>
+</html>
