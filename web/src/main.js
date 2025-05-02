@@ -116,7 +116,8 @@ async function runGPU() {
     const dataBufferSets = [0, 0].map(() => new DataBuffers());
     const kernel = new Kernel(makeRanges([[inputRangesSize.value, inputRangesCount.value]]));
 
-    let prevIterationDonePromise = Promise.resolve();
+    let prevKernelPromise = Promise.resolve();
+    let prevIterationPromise = Promise.resolve();
     let itersSinceLastPrint = 0;
     let timeGpu = 0;
     let start = performance.now();
@@ -128,8 +129,10 @@ async function runGPU() {
 
         await workerPool.generateLayouts(inputWorkerCount.value, BigInt(iterStartStructureSeed), BigInt(2**bitsPerIter), dataBuffers.inputHostBuffer);
 
-        const iterationDonePromise = kernel.run(dataBuffers).then(() => {
-            const gpuEnd = performance.now();
+        const gpuStartPromise = prevKernelPromise.then(() => performance.now());
+        const kernelPromise = kernel.run(dataBuffers);
+        const gpuEndPromise = kernelPromise.then(() => performance.now());
+        const iterationPromise = Promise.all([gpuStartPromise, gpuEndPromise, prevIterationPromise]).then(([gpuStart, gpuEnd]) => {
             timeGpu += gpuEnd - gpuStart;
 
             const resultCount = dataBuffers.outputHostBuffer[0];
@@ -172,13 +175,13 @@ async function runGPU() {
             }
         });
 
-        await prevIterationDonePromise;
-        const gpuStart = performance.now();
+        await prevIterationPromise;
 
-        prevIterationDonePromise = iterationDonePromise;
+        prevKernelPromise = kernelPromise;
+        prevIterationPromise = iterationPromise;
     }
 
-    await prevIterationDonePromise;
+    await prevIterationPromise;
 }
 
 const benchLayoutButton = /** @type {HTMLButtonElement} */ (document.getElementById("bench-layout-button"));
@@ -201,7 +204,10 @@ runGPUButton.addEventListener("click", () => {
     inputBitsPerIter.element.disabled = true;
     inputRangesSize.element.disabled = true;
     inputRangesCount.element.disabled = true;
-    runGPU().catch(e => log(`Error: ${e}`, 'color: red;')).finally(() => {
+    runGPU().catch(e => {
+        console.error(e);
+        log(`Error: ${e}`, 'color: red;');
+    }).finally(() => {
         log(`Stopped at ${inputStartSeed.value}`);
         runGPUButton.disabled = false
         stopGPUButton.disabled = true;
