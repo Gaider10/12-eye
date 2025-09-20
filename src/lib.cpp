@@ -7,7 +7,7 @@
 #include "stronghold_generator/StrongholdGenerator.h"
 #include "../cubiomes/finders.h"
 
-extern "C" uint32_t generate_layouts(uint64_t structure_seed_start, uint64_t structure_seed_end, Layout *out, uint32_t out_len) {
+extern "C" uint32_t generate_layouts(uint64_t structure_seed_start, uint64_t structure_seed_end, bool superflat, Layout *out, uint32_t out_len) {
     uint32_t count = 0;
 
     if (count >= out_len) return count;
@@ -15,7 +15,7 @@ extern "C" uint32_t generate_layouts(uint64_t structure_seed_start, uint64_t str
     stronghold_generator::StrongholdGenerator strongholdGenerator;
     for (uint64_t structure_seed = structure_seed_start; structure_seed < structure_seed_end; structure_seed++) {
         int startChunkX, startChunkZ;
-        stronghold_generator::StrongholdGenerator::getFirstPosFast(structure_seed, startChunkX, startChunkZ);
+        stronghold_generator::StrongholdGenerator::getFirstPosFast(structure_seed, superflat, startChunkX, startChunkZ);
         // stronghold_generator::StrongholdGenerator::getFirstPosOrigin(structure_seed, startChunkX, startChunkZ);
         strongholdGenerator.generate(structure_seed, startChunkX, startChunkZ);
         stronghold_generator::Piece *portalRoomPiece = strongholdGenerator.portalRoomPiece;

@@ -6,7 +6,7 @@ import CreateModule from './lib.mjs';
 
 /**
  * @type {EmscriptenModule & {
- *   _generate_layouts: (structure_seed_start: bigint, structure_seed_end: bigint, out: number, out_len: number) => number,
+ *   _generate_layouts: (structure_seed_start: bigint, structure_seed_end: bigint, superflat: boolean, out: number, out_len: number) => number,
  *   _test_world_seed: (world_seed: bigint, start_chunk_x: number, start_chunk_z: number) => number,
  * }}
  */
@@ -20,7 +20,7 @@ const Module = await CreateModule();
 function generate_layouts(structure_seed_start, structure_seed_end) {
     const out_len = Number(structure_seed_end - structure_seed_start) + 64;
     const out = Module._malloc(16 * out_len);
-    const count = Module._generate_layouts(structure_seed_start, structure_seed_end, out, out_len);
+    const count = Module._generate_layouts(structure_seed_start, structure_seed_end, false, out, out_len);
     const res = Module.HEAPU32.slice(out / 4, out / 4 + count * 4);
     Module._free(out);
     return res;

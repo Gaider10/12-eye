@@ -188,7 +188,7 @@ struct LayoutThreadPool {
         return state;
     }
 
-    void start_layout_threads(uint32_t structure_seed_hi) {
+    void start_layout_threads(uint32_t structure_seed_hi, bool superflat) {
         if (state == LayoutThreadPoolState::Running) throw std::runtime_error("Already Running");
 
         uint64_t full_structure_seed_start = (uint64_t)structure_seed_hi << 16;
@@ -202,7 +202,7 @@ struct LayoutThreadPool {
             auto &thread_inputs = thread_data.inputs;
 
             thread_data.thread = std::thread([=, &thread_inputs](){
-                uint32_t count = generate_layouts(structure_seed_start, structure_seed_end, thread_inputs.data(), thread_inputs.size());
+                uint32_t count = generate_layouts(structure_seed_start, structure_seed_end, superflat, thread_inputs.data(), thread_inputs.size());
                 thread_inputs.resize(count);
             });
         }
@@ -236,12 +236,12 @@ private:
     LayoutThreadPoolState state;
 };
 
-void run(uint32_t structure_seed_hi, LayoutThreadPool &layout_thread_pool) {
+void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_thread_pool) {
     outputs_count = 0;
     inputs_count = 0;
 
     if (layout_thread_pool.get_state() == LayoutThreadPoolState::Empty) {
-        layout_thread_pool.start_layout_threads(structure_seed_hi);
+        layout_thread_pool.start_layout_threads(structure_seed_hi, superflat);
         layout_thread_pool.join_layout_threads();
     }
 
@@ -255,7 +255,7 @@ void run(uint32_t structure_seed_hi, LayoutThreadPool &layout_thread_pool) {
     cudaCheckError( cudaPeekAtLastError() );
 
     if (!no_layouts) {
-        layout_thread_pool.start_layout_threads(structure_seed_hi + 1);
+        layout_thread_pool.start_layout_threads(structure_seed_hi + 1, superflat);
     }
 
     cudaCheckError( cudaDeviceSynchronize() );
@@ -281,7 +281,7 @@ void run(uint32_t structure_seed_hi, LayoutThreadPool &layout_thread_pool) {
         // int startChunkZ = 0;
         // stronghold_generator::StrongholdGenerator::getFirstPosFast(world_seed, startChunkX, startChunkZ);
         // printf("Seed: %lli Start: %i %i Pos: %i ~ %i\n", world_seed, startChunkX, startChunkZ, (int32_t)inputChunkPos.chunk_x << 4, (int32_t)inputChunkPos.chunk_z << 4);
-        bool is_valid = test_world_seed(outputChunkPos.world_seed, outputChunkPos.start_chunk_x, outputChunkPos.start_chunk_z);
+        bool is_valid = superflat || test_world_seed(outputChunkPos.world_seed, outputChunkPos.start_chunk_x, outputChunkPos.start_chunk_z);
         std::printf("Seed: %" PRIi64 " Start: %i %i Pos: %i ~ %i Valid: %s\n", outputChunkPos.world_seed, outputChunkPos.start_chunk_x, outputChunkPos.start_chunk_z, outputChunkPos.portal_chunk_x << 4, outputChunkPos.portal_chunk_z << 4, is_valid ? "YES" : "no");
     }
 }
@@ -350,7 +350,7 @@ void bench_layout() {
     auto start = std::chrono::steady_clock::now();
 
     for (uint64_t i = 0;; i++) {
-        uint32_t count = generate_layouts(i * out_len, i * out_len + out_len, out.data(), out_len);
+        uint32_t count = generate_layouts(i * out_len, i * out_len + out_len, false, out.data(), out_len);
         std::printf("%" PRIu32 " / %" PRIu32 "\n", count, out_len);
 
         uint64_t print_interval = 1;
@@ -373,6 +373,7 @@ int main(int argc, char **argv) {
     uint32_t count = UINT32_MAX;
     uint32_t print_interval = 8;
     uint32_t threads = 12;
+    bool superflat = false;
 
     for (int i = 1; i < argc; i++) {
         if (std::strcmp("--bench", argv[i]) == 0) {
@@ -411,8 +412,10 @@ int main(int argc, char **argv) {
                 std::fprintf(stderr, "Invalid --print-interval: %s\n", argv[i]);
                 return 1;
             }
+        } else if (std::strcmp("--superflat", argv[i]) == 0) {
+            superflat = true;
         } else {
-            std::fprintf(stderr, "Unknwon arg: %s\n", argv[i]);
+            std::fprintf(stderr, "Unknown arg: %s\n", argv[i]);
             return 1;
         }
     }
@@ -439,6 +442,7 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "end = %"  PRIu32 "\n", end);
     std::fprintf(stderr, "threads = %"  PRIu32 "\n", threads);
     std::fprintf(stderr, "print_interval = %" PRIu32 "\n", print_interval);
+    std::fprintf(stderr, "superflat = %s\n", superflat ? "true" : "false");
 
     precompute();
 
@@ -461,7 +465,7 @@ int main(int argc, char **argv) {
 
     for (uint32_t iter = 0;; iter++) {
         uint32_t structure_seed_hi = start + iter;
-        run(structure_seed_hi, layout_thread_pool);
+        run(structure_seed_hi, superflat, layout_thread_pool);
         structure_seed_hi += 1;
 
         if (print_interval != 0 && (iter + 1) % print_interval == 0) {

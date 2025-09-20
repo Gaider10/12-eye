@@ -10,13 +10,18 @@ void stronghold_generator::StrongholdGenerator::getFirstPosOrigin(long long worl
     o_chunkZ = (int)round(sin(angle) * distance);
 }
 
-void stronghold_generator::StrongholdGenerator::getFirstPosFast(long long worldSeed, int &o_chunkX, int &o_chunkZ) {
-    Random random(worldSeed);
+void stronghold_generator::StrongholdGenerator::getFirstPosFast(long long worldSeed, bool superflat, int &o_chunkX, int &o_chunkZ) {
+    Random random(superflat ? 0 : worldSeed);
     double angle = random.nextDouble() * 3.141592653589793 * 2.0;
     double distance = (double)(4 * 32) + (random.nextDouble() - 0.5) * ((double)32 * 2.5);
     int chunkX = (int)round(cos(angle) * distance);
     int chunkZ = (int)round(sin(angle) * distance);
     random.setSeed(random.nextLong());
+    if (superflat) {
+        o_chunkX = ((chunkX << 4) + 8 - 112 + random.nextInt(112 * 2 + 1)) >> 4;
+        o_chunkZ = ((chunkZ << 4) + 8 - 112 + random.nextInt(112 * 2 + 1)) >> 4;
+        return;
+    }
     int biomeCenterX = ((chunkX << 4) + 8) >> 2;
     int biomeCenterZ = ((chunkZ << 4) + 8) >> 2;
     int biomeRadius = 112 >> 2;

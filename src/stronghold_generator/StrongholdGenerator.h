@@ -27,7 +27,7 @@ namespace stronghold_generator {
         StrongholdGenerator();
 
         static void getFirstPosOrigin(long long worldSeed, int &chunkX, int &chunkZ);
-        static void getFirstPosFast(long long worldSeed, int &chunkX, int &chunkZ);
+        static void getFirstPosFast(long long worldSeed, bool superflat, int &chunkX, int &chunkZ);
         static void getFirstPos(long long worldSeed, int &chunkX, int &chunkZ);
         void generate(long long worldSeed, int chunkX, int chunkZ);
 
