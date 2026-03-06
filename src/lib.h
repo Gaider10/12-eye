@@ -9,4 +9,4 @@ struct Layout {
 };
 
 extern "C" uint32_t generate_layouts(uint64_t structure_seed_start, uint64_t structure_seed_end, bool superflat, Layout *out, uint32_t out_len);
-extern "C" bool test_world_seed(uint64_t world_seed, int32_t start_chunk_x, int32_t start_chunk_z);
+extern "C" int test_world_seed(uint64_t world_seed, int32_t start_chunk_x, int32_t start_chunk_z);

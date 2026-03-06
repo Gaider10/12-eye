@@ -5,7 +5,6 @@
 #include <algorithm>
 
 #include "stronghold_generator/StrongholdGenerator.h"
-#include "../cubiomes/finders.h"
 
 extern "C" uint32_t generate_layouts(uint64_t structure_seed_start, uint64_t structure_seed_end, bool superflat, Layout *out, uint32_t out_len) {
     uint32_t count = 0;
@@ -49,16 +48,4 @@ extern "C" uint32_t generate_layouts(uint64_t structure_seed_start, uint64_t str
     }
 
     return count;
-}
-
-extern "C" bool test_world_seed(uint64_t world_seed, int32_t start_chunk_x, int32_t start_chunk_z) {
-    Generator generator;
-    setupGenerator(&generator, MC_NEWEST, 0);
-    applySeed(&generator, 0, world_seed);
-
-    StrongholdIter strongholdIter;
-    initFirstStronghold(&strongholdIter, generator.mc, world_seed);
-    nextStronghold(&strongholdIter, &generator);
-
-    return strongholdIter.pos.x >> 4 == start_chunk_x && strongholdIter.pos.z >> 4 == start_chunk_z;
 }
