@@ -89,11 +89,7 @@ __device__ void copy_precomp(Precomp &precomp_shared) {
     }
 }
 
-__device__ bool test_world_seed_skip(Precomp &precomp_shared, uint64_t world_seed, int32_t chunk_x, int32_t chunk_z) {
-    uint64_t decoration_seed = xrsr128_getDecorationSeed(world_seed, chunk_x, chunk_z);
-
-    XRSR128 rng;
-    xrsr_seed(&rng, decoration_seed + 40019);
+__device__ bool test_seeded_decoration_seed(Precomp &precomp_shared, XRSR128 rng) {
     uint64_t lo = rng.lo;
     uint64_t hi = rng.hi;
 
@@ -127,6 +123,14 @@ __device__ bool test_world_seed_skip(Precomp &precomp_shared, uint64_t world_see
     }
 
     return true;
+}
+
+__device__ bool test_world_seed_skip(Precomp &precomp_shared, uint64_t world_seed, int32_t chunk_x, int32_t chunk_z) {
+    uint64_t decoration_seed = xrsr128_getDecorationSeed(world_seed, chunk_x, chunk_z);
+
+    XRSR128 rng;
+    xrsr_seed(&rng, decoration_seed + 40019);
+    return test_seeded_decoration_seed(precomp_shared, rng);
 }
 
 __global__ void filter_skip() {
@@ -417,15 +421,30 @@ void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_th
 
     if (layout_thread_pool.get_state() == LayoutThreadPoolState::Empty) {
         layout_thread_pool.start_layout_threads(structure_seed_hi, superflat);
+    }
+
+    if (layout_thread_pool.get_state() == LayoutThreadPoolState::Running) {
+        auto start = std::chrono::steady_clock::now();
+
         layout_thread_pool.join_layout_threads();
+
+        auto end = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1E-9;
+        if (elapsed > 0.005) {
+            printf("CPU Thread join took %.3f s\n", elapsed);
+        }
     }
 
     layout_thread_pool.copy_data();
 
+    if (!no_layouts) {
+        layout_thread_pool.start_layout_threads(structure_seed_hi + 1, superflat);
+    }
+
     // printf("inputs_count = %" PRIu64 " invocations = %" PRIu64 "\n", inputs_count, inputs_count * COUNT16);
 
     uint32_t thread_count = inputs_count * (1 << 16);
-    uint32_t block_count = (thread_count - 1) / skip_threads_per_block + 1;
+    uint32_t block_count = thread_count / skip_threads_per_block;
     if (filter_type == FilterType::Skip) {
         filter_skip<<<block_count, skip_threads_per_block>>>();
     } else {
@@ -439,11 +458,6 @@ void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_th
         }
     }
     cudaCheckError(cudaPeekAtLastError());
-
-    if (!no_layouts) {
-        layout_thread_pool.start_layout_threads(structure_seed_hi + 1, superflat);
-    }
-
     cudaCheckError(cudaDeviceSynchronize());
 
     if (filter_type == FilterType::Bloom && bloom_outputs_count >= bloom_outputs_size) {
@@ -454,23 +468,7 @@ void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_th
         std::fprintf(stderr, "outputs_count >= outputs_size: %" PRIu32 " >= %" PRIu32 "\n", outputs_count, outputs_size);
     }
 
-    if (filter_type == FilterType::Bloom && no_bloom_postfiler) {
-        outputs_count = bloom_outputs_count;
-    }
-
-    auto start = std::chrono::steady_clock::now();
-
-    if (!no_layouts) {
-        layout_thread_pool.join_layout_threads();
-    }
-
-    auto end = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1E-9;
-    if (elapsed > 0.005) {
-        printf("CPU Thread join took %.3f s\n", elapsed);
-    }
-
-    if (!no_bloom_postfiler) {
+    if (filter_type != FilterType::Bloom || !no_bloom_postfiler) {
         for (uint64_t i = 0; i < outputs_count; i++) {
             OutputChunkPos outputChunkPos = outputs[i];
             // InputChunkPos inputChunkPos = inputs[outputChunkPos.input_index];
@@ -564,6 +562,78 @@ void bench_layout() {
     }
 }
 
+namespace KernelBruteforceDecorationSeeds {
+    constexpr uint32_t threads_per_block = 256;
+    constexpr uint32_t seeds_per_thread = 16;
+
+    __global__ void kernel(uint32_t hi) {
+        __shared__ Precomp precomp_shared;
+        copy_precomp(precomp_shared);
+        __syncthreads();
+
+        uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+
+        // uint64_t decoration_seed = ((uint64_t)hi << 32) + index;
+        // XRSR128 rng;
+        // uint64_t feature_seed = decoration_seed + 40019;
+        // feature_seed ^= XRSR_SILVER_RATIO;
+        // rng.lo = mix64(feature_seed);
+        // rng.hi = mix64(feature_seed + XRSR_GOLDEN_RATIO);
+        // if (!test_seeded_decoration_seed(precomp_shared, rng)) return;
+
+        // uint64_t iter_seed = ((uint64_t)hi << 32) + index;
+        // XRSR128 rng;
+        // rng.lo = mix64(iter_seed);
+        // rng.hi = mix64(iter_seed + XRSR_GOLDEN_RATIO);
+        // if (!test_seeded_decoration_seed(precomp_shared, rng)) return;
+
+        // uint32_t output_index = atomicAdd(&outputs_count, 1);
+
+        uint64_t iter_seed = ((uint64_t)hi << 32) + index * XRSR_GOLDEN_RATIO;
+        uint64_t prev_mix = mix64(iter_seed);
+        #pragma unroll
+        for (int i = 0; i < seeds_per_thread; i++) {
+            uint64_t next_mix = mix64(iter_seed + (i + 1) * XRSR_GOLDEN_RATIO);
+            XRSR128 rng;
+            rng.lo = prev_mix;
+            rng.hi = next_mix;
+            prev_mix = next_mix;
+            if (!test_seeded_decoration_seed(precomp_shared, rng)) continue;
+
+            uint32_t output_index = atomicAdd(&outputs_count, 1);
+        }
+    }
+}
+
+void bench_decoration(uint32_t print_interval) {
+    auto time_start = std::chrono::steady_clock::now();
+    uint64_t total_inputs = 0;
+
+    for (uint32_t iter = 0;; iter++) {
+        uint64_t seeds_per_run = UINT64_C(1) << 32;
+        uint64_t threads_per_run = seeds_per_run / KernelBruteforceDecorationSeeds::seeds_per_thread;
+        uint32_t blocks_per_run = threads_per_run / KernelBruteforceDecorationSeeds::threads_per_block;
+        KernelBruteforceDecorationSeeds::kernel<<<blocks_per_run, KernelBruteforceDecorationSeeds::threads_per_block>>>(iter * XRSR_GOLDEN_RATIO);
+        cudaCheckError(cudaPeekAtLastError());
+        cudaCheckError(cudaDeviceSynchronize());
+
+        total_inputs += seeds_per_run;
+
+        if (print_interval != 0 && (iter + 1) % print_interval == 0) {
+            auto time_end = std::chrono::steady_clock::now();
+            double delta = std::chrono::duration_cast<std::chrono::nanoseconds>(time_end - time_start).count() * 1E-9;
+            double sps = total_inputs / delta;
+            std::fprintf(stderr, "%" PRIu32 " | %.2f Gsps | %.2f d\n",
+                iter,
+                sps * 1E-9,
+                ((UINT64_C(1) << 32) - iter) * seeds_per_run / sps / 3600 / 24
+            );
+            total_inputs = 0;
+            time_start = time_end;
+        }
+    }
+}
+
 std::vector<uint64_t> generate_random_decoration_seeds() {
     std::fprintf(stderr, "generate_random_decoration_seeds begin\n");
 
@@ -626,6 +696,7 @@ auto floor_pow2(auto val) {
 
 int main(int argc, char **argv) {
     bool run_bench_layout = false;
+    bool run_bench_decoration = false;
     uint32_t start = UINT32_MAX;
     uint32_t end = UINT32_MAX;
     uint32_t count = UINT32_MAX;
@@ -642,7 +713,9 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (std::strcmp("--bench-layout", argv[i]) == 0) {
             run_bench_layout = true;
-        } else if (std::strcmp("--profile", argv[i]) == 0) {
+        } else if (std::strcmp("--bench-decoration", argv[i]) == 0) {
+            run_bench_decoration = true;
+        }else if (std::strcmp("--profile", argv[i]) == 0) {
             profiling = true;
         } else if (std::strcmp("--no-layouts", argv[i]) == 0) {
             no_layouts = true;
@@ -710,6 +783,11 @@ int main(int argc, char **argv) {
 
     if (run_bench_layout) {
         bench_layout();
+        return 0;
+    }
+
+    if (run_bench_decoration) {
+        bench_decoration(print_interval);
         return 0;
     }
 
