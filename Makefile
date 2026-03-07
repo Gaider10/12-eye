@@ -5,7 +5,7 @@ LIB_SRC = src/lib.cpp src/lib.c $(STRONGHOLD_GENERATOR_SRC) $(CUBIOMES_SRC)
 override NVCC_FLAGS += -std=c++20 -O3 --expt-relaxed-constexpr -arch=native --generate-line-info
 
 ifeq ($(OS),Windows_NT)
-	override NVCC_FLAGS += -Xcompiler /Zc:preprocessor -Xcompiler /GL
+	override NVCC_FLAGS += -Xcompiler /Zc:preprocessor -Xcompiler /GL -Xlinker /OPT:NOREF
 	EXE = .exe
 endif
 
