@@ -12,6 +12,9 @@ endif
 main: FORCE
 	nvcc src/12eye.cu $(LIB_SRC) -o main$(EXE) $(NVCC_FLAGS)
 
+main-ptx: FORCE
+	nvcc -ptx src/12eye.cu -o main.ptx $(NVCC_FLAGS)
+
 WASM_EXPORTED = -sEXPORTED_FUNCTIONS=_malloc,_free,_generate_layouts,_test_world_seed
 
 wasm: FORCE

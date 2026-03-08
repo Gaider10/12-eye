@@ -19,8 +19,8 @@ typedef struct xrsr128 XRSR128;
 typedef struct xrsrmat XRSRMAT;
 
 struct xrsr128 {
-	uint64_t hi;
 	uint64_t lo;
+	uint64_t hi;
 };
 
 struct xrsrmat {

@@ -10,9 +10,19 @@
 #include <random>
 #include <stdexcept>
 #include <array>
+#include <cassert>
+#include <numeric>
 #include <cuda/annotated_ptr>
 
 #include "lib.h"
+
+#define cudaCheckError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
+   if (code != cudaSuccess) {
+      std::fprintf(stderr, "Cuda Error: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
 constexpr uint32_t skip_threads_per_block = 256;
 constexpr uint32_t bloom_threads_per_block = 128;
@@ -37,26 +47,9 @@ __managed__ uint32_t outputs_count;
 constexpr uint32_t bloom_outputs_size = 67108864;
 __managed__ uint32_t bloom_outputs_count;
 
-struct PrecompItem {
-    uint32_t xrsr[4];
-};
-
-constexpr uint32_t precomp_size = 32 * 20;
-
-struct Precomp {
-    PrecompItem items[precomp_size];
-};
-
-__device__ Precomp precomp_global;
-
 __device__ void xrsr128_xor(XRSR128 *rng, XRSR128 xor_) {
     rng->lo ^= xor_.lo;
     rng->hi ^= xor_.hi;
-}
-
-__device__ void xrsr128_xor(XRSR128 *rng, PrecompItem &xor_) {
-    rng->lo ^= ((uint64_t)xor_.xrsr[1] << 32) | xor_.xrsr[0];
-    rng->hi ^= ((uint64_t)xor_.xrsr[3] << 32) | xor_.xrsr[2];
 }
 
 __device__ int32_t xrsr128_next_bits(XRSR128 *rng, int32_t bits) {
@@ -70,52 +63,196 @@ __device__ int64_t xrsr128_nextLong(XRSR128 *rng) {
 __device__ uint64_t xrsr128_getDecorationSeed(uint64_t world_seed, int32_t chunk_x, int32_t chunk_z) {
     XRSR128 rng;
     xrsr_seed(&rng, world_seed);
-    uint64_t a = xrsr128_nextLong(&rng) | 1LL;
-    uint64_t b = xrsr128_nextLong(&rng) | 1LL;
+    uint64_t a = xrsr128_nextLong(&rng) | 1;
+    uint64_t b = xrsr128_nextLong(&rng) | 1;
     return (chunk_x << 4) * a + (chunk_z << 4) * b ^ world_seed;
 }
 
-__device__ void copy_precomp(Precomp &precomp_shared) {
-    constexpr uint32_t precomp_size_u32 = sizeof(Precomp) / 4;
+struct ChunkType {
+    uint32_t size;
+    uint32_t count;
+};
 
-    for (uint32_t i = 0; i < precomp_size_u32 / skip_threads_per_block; i++) {
-        uint32_t index = i * skip_threads_per_block + threadIdx.x;
-        reinterpret_cast<uint32_t*>(&precomp_shared)[index] = reinterpret_cast<uint32_t*>(&precomp_global)[index];
+struct ChunkInfo {
+    uint32_t bit_offset;
+    uint32_t size;
+    uint32_t lut_offset;
+};
+
+template<ChunkType... ChunksTypes>
+struct ChunkedSkip {
+    constexpr static std::array<ChunkType, sizeof...(ChunksTypes)> chunk_types {ChunksTypes...};
+    constexpr static uint32_t chunked_bits_count = std::accumulate(chunk_types.begin(), chunk_types.end(), 0, [](uint32_t acc, auto &chunk_type){ return acc + chunk_type.size * chunk_type.count; });
+    constexpr static uint32_t unchunked_bits_count = 128 - chunked_bits_count;
+    constexpr static uint32_t chunks_count = std::accumulate(chunk_types.begin(), chunk_types.end(), 0, [](uint32_t acc, auto &chunk_type){ return acc + chunk_type.count; });
+    constexpr static uint32_t operations_count = unchunked_bits_count + chunks_count;
+
+    constexpr ChunkedSkip() : chunks(), operations(), lut_entries() {
+        bool chunked_bits[128] = {};
+
+        uint32_t bit_offset = 0;
+        uint32_t chunk_index = 0;
+        uint32_t lut_offset = 0;
+        for (const auto &chunk_type : chunk_types) {
+            for (uint32_t i = 0; i < chunk_type.count; i++) {
+                if (bit_offset % 64 + chunk_type.size > 64) {
+                    bit_offset = bit_offset / 64 * 64 + 64;
+                }
+
+                chunks[chunk_index++] = { bit_offset, chunk_type.size, lut_offset };
+
+                for (uint32_t j = 0; j < chunk_type.size; j++) {
+                    if (bit_offset >= 128) throw std::invalid_argument("Chunks don't fit");
+                    chunked_bits[bit_offset++] = true;
+                }
+
+                lut_offset += 1 << chunk_type.size;
+            }
+        }
+
+        lut_entries = lut_offset;
+
+        uint32_t unchunked_bit_index = 0;
+        uint32_t unchunked_bits[unchunked_bits_count + 1];
+        for (int i = 0; i < 128; i++) {
+            if (chunked_bits[i]) continue;
+
+            unchunked_bits[unchunked_bit_index++] = i;
+        }
+        if (unchunked_bit_index != unchunked_bits_count) throw std::logic_error("");
+
+        // {
+        //     uint32_t bit_index = 0;
+        //     uint32_t chunk_index = 0;
+        //     for (uint32_t operation_index = 0; operation_index < operations_count; operation_index++) {
+        //         if (bit_index * chunks_count <= chunk_index * unchunked_bits_count) {
+        //             operations[operation_index] = unchunked_bits[bit_index++];
+        //         } else {
+        //             operations[operation_index] = 0x80000000 | chunk_index++;
+        //         }
+        //     }
+        // }
+
+        for (uint32_t i = 0; i < unchunked_bits_count; i++) {
+            operations[i] = unchunked_bits[i];
+        }
+
+        for (uint32_t i = 0; i < chunks_count; i++) {
+            operations[unchunked_bits_count + i] = 0x80000000 | i;
+        }
     }
 
-    if (precomp_size_u32 % skip_threads_per_block != 0 && threadIdx.x < precomp_size_u32 % skip_threads_per_block) {
-        uint32_t index = precomp_size_u32 / skip_threads_per_block * skip_threads_per_block + threadIdx.x;
-        reinterpret_cast<uint32_t*>(&precomp_shared)[index] = reinterpret_cast<uint32_t*>(&precomp_global)[index];
+    ChunkInfo chunks[chunks_count];
+    uint32_t operations[operations_count];
+    uint32_t lut_entries;
+
+    void *generate_lut() const {
+        auto host_lut = std::make_unique<XRSR128[]>(lut_entries);
+
+        for (const auto &chunk : chunks) {
+            for (uint32_t bits = 0; bits < 1 << chunk.size; bits++) {
+                uint64_t word = (uint64_t)bits << chunk.bit_offset % 64;
+                uint64_t lo = chunk.bit_offset < 64 ? word : 0;
+                uint64_t hi = chunk.bit_offset < 64 ? 0 : word;
+                XRSR128 rng = {};
+                skip_cpu(&rng, lo, hi);
+                host_lut[chunk.lut_offset + bits] = rng;
+            }
+        }
+
+        size_t lut_size = lut_entries * sizeof(XRSR128);
+        void *device_lut;
+        cudaCheckError(cudaMalloc(&device_lut, lut_size));
+        cudaCheckError(cudaMemcpy(device_lut, host_lut.get(), lut_size, cudaMemcpyHostToDevice));
+
+        std::fprintf(stderr, "lut_size = %zu\n", lut_size);
+        std::fprintf(stderr, "chunked_bits = %" PRIu32 "\n", chunked_bits_count);
+        std::fprintf(stderr, "unchunked_bits = %" PRIu32 "\n", unchunked_bits_count);
+        // std::fprintf(stderr, "operations = {\n");
+        // for (uint32_t operation : operations) {
+        //     if (operation & 0x80000000) {
+        //         const auto &chunk = chunks[operation & 0x7FFFFFFF];
+        //         std::fprintf(stderr, "  Chunk { .bit_offset = %" PRIu32 ", .size = %" PRIu32 ", .lut_offset = %" PRIu32 " }\n", chunk.bit_offset, chunk.size, chunk.lut_offset);
+        //     } else {
+        //         uint32_t bit_index = operation;
+        //         std::fprintf(stderr, "  Bit { .bit_index = %" PRIu32 " }\n", bit_index);
+        //     }
+        // }
+        // std::fprintf(stderr, "}\n");
+
+        return device_lut;
     }
-}
 
-__device__ bool test_seeded_decoration_seed(Precomp &precomp_shared, XRSR128 rng) {
-    uint64_t lo = rng.lo;
-    uint64_t hi = rng.hi;
+    __device__ XRSR128 apply(XRSR128 rng, void *lut) const {
+        XRSR128 out = {};
+        // XRSR128 outs[2] = {};
 
-    skip_gpu(&rng);
+        #pragma unroll
+        for (uint32_t i = 0; i < operations_count; i++) {
+            // XRSR128 &out = outs[i % 2];
+            uint32_t operation = operations[i];
+            if (operation & 0x80000000) {
+                const auto &chunk = chunks[operation & 0x7FFFFFFF];
+                uint64_t word = chunk.bit_offset < 64 ? rng.lo : rng.hi;
+                uint32_t index = (word >> chunk.bit_offset % 64) & ((UINT32_C(1) << chunk.size) - 1);
+                ulonglong2 val = __ldg((ulonglong2*)lut + chunk.lut_offset + index);
+                out.lo ^= val.x;
+                out.hi ^= val.y;
+                // uint64_t lo, hi;
+                // asm("ld.global.nc.L1::evict_last.v2.u64 { %0, %1 }, [%2];" : "=l"(lo), "=l"(hi) : "l"((XRSR128*)lut + chunk.lut_offset + index));
+                // out.lo ^= lo;
+                // out.hi ^= hi;
+                // XRSR128 *val = (XRSR128*)lut + chunk.lut_offset + index;
+                // out.lo ^= val->lo;
+                // out.hi ^= val->hi;
+                // ulonglong2 *val = (ulonglong2*)lut + chunk.lut_offset + index;
+                // out.lo ^= val->x;
+                // out.hi ^= val->y;
+                // XRSR128 val = *((XRSR128*)lut + chunk.lut_offset + index);
+                // out.lo ^= val.lo;
+                // out.hi ^= val.hi;
+            } else {
+                uint32_t bit_index = operation;
+                uint64_t word = bit_index < 64 ? rng.lo : rng.hi;
+                if ((word >> bit_index % 64) & 1) {
+                    out.lo ^= bit_skips[bit_index].lo;
+                    out.hi ^= bit_skips[bit_index].hi;
+                }
+            }
+        }
 
-    xrsr128_xor(&rng, precomp_shared.items[32 *  0 + ((lo >>       0) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  1 + ((lo >>       5) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  2 + ((lo >>      10) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  3 + ((lo >>      15) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  4 + ((lo >>      20) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  5 + ((lo >>      25) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  6 + ((lo >> 32 +  0) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  7 + ((lo >> 32 +  5) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  8 + ((lo >> 32 + 10) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 *  9 + ((lo >> 32 + 15) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 10 + ((lo >> 32 + 20) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 11 + ((lo >> 32 + 25) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 12 + ((hi >>       0) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 13 + ((hi >>       5) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 14 + ((hi >>      10) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 15 + ((hi >>      15) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 16 + ((hi >>      20) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 17 + ((hi >>      25) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 18 + ((hi >> 32 +  0) & 31)]);
-    xrsr128_xor(&rng, precomp_shared.items[32 * 19 + ((hi >> 32 +  5) & 31)]);
+        // out = outs[0];
+        // out.lo ^= outs[1].lo;
+        // out.hi ^= outs[1].hi;
 
+        return out;
+    }
+};
+
+#ifdef __CUDA_ARCH__
+#define HOST_DEVICE __device__
+#else
+#define HOST_DEVICE
+#endif
+
+// optimized for a 3070
+HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 12), ChunkType(10, 1)> skip_chunked_skip; // 19.02
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 13)> skip_chunked_skip; // 18.82
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 14)> skip_chunked_skip; // 18.05
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 12)> skip_chunked_skip; // 17.21
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 11), ChunkType(10, 2)> skip_chunked_skip; // 13.71
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 10), ChunkType(10, 3)> skip_chunked_skip; // 11.77
+HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 8), ChunkType(10, 3)> decoration_chunked_skip; // 24.92
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 9), ChunkType(10, 2)> decoration_chunked_skip; // 24.85
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 10), ChunkType(10, 1)> decoration_chunked_skip; // 24.61
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 11)> decoration_chunked_skip; // 24.21
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 12)> decoration_chunked_skip; // 17.40 | 23.00
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(10, 1), ChunkType(9, 11)> decoration_chunked_skip; // 17.38 | 22.80
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 10)> decoration_chunked_skip; // 21.51
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(8, 13)> decoration_chunked_skip; // 21.49
+// HOST_DEVICE constexpr ChunkedSkip<ChunkType(9, 7), ChunkType(10, 4)> decoration_chunked_skip; // 17.47
+
+__device__ bool test_12_eyes(XRSR128 rng, void *lut) {
     for (int j = 0; j < 12; j++) {
         if (xrsr_long(&rng) < 16602070326045573120ULL) {
             return false;
@@ -125,20 +262,16 @@ __device__ bool test_seeded_decoration_seed(Precomp &precomp_shared, XRSR128 rng
     return true;
 }
 
-__device__ bool test_world_seed_skip(Precomp &precomp_shared, uint64_t world_seed, int32_t chunk_x, int32_t chunk_z) {
+__device__ bool test_world_seed_skip(uint64_t world_seed, int32_t chunk_x, int32_t chunk_z, void *lut) {
     uint64_t decoration_seed = xrsr128_getDecorationSeed(world_seed, chunk_x, chunk_z);
 
     XRSR128 rng;
     xrsr_seed(&rng, decoration_seed + 40019);
-    return test_seeded_decoration_seed(precomp_shared, rng);
+    rng = skip_chunked_skip.apply(rng, lut);
+    return test_12_eyes(rng, lut);
 }
 
-__global__ void filter_skip() {
-    __shared__ Precomp precomp_shared;
-
-    copy_precomp(precomp_shared);
-    __syncthreads();
-
+__global__ void filter_skip(void *lut) {
     uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t world_seed_hi = index & 0xFFFF;
     uint32_t input_index = index >> 16;
@@ -147,7 +280,7 @@ __global__ void filter_skip() {
     InputChunkPos input = inputs[input_index];
     uint64_t world_seed = ((uint64_t)world_seed_hi << 48) | input.structure_seed;
 
-    if (!test_world_seed_skip(precomp_shared, world_seed, input.portal_chunk_x, input.portal_chunk_z)) return;
+    if (!test_world_seed_skip(world_seed, input.portal_chunk_x, input.portal_chunk_z, lut)) return;
 
     uint32_t output_index = atomicAdd(&outputs_count, 1);
     if (output_index < outputs_size) {
@@ -273,16 +406,12 @@ __global__ void filter_bloom(DeviceBloomFilter bloom_filter, DeviceInputsPtr inp
     // }
 }
 
-__global__ void filter_skip_second(DeviceOutputsPtr inputs) {
-    __shared__ Precomp precomp_shared;
-    copy_precomp(precomp_shared);
-    __syncthreads();
-
+__global__ void filter_skip_second(DeviceOutputsPtr inputs, void *lut) {
     uint32_t inputs_len = std::min(bloom_outputs_count, (uint32_t)bloom_outputs_size);
     for (uint32_t index = blockIdx.x * blockDim.x + threadIdx.x; index < inputs_len; index += gridDim.x * blockDim.x) {
         OutputChunkPos input = inputs[index];
 
-        if (!test_world_seed_skip(precomp_shared, input.world_seed, input.portal_chunk_x, input.portal_chunk_z)) return;
+        if (!test_world_seed_skip(input.world_seed, input.portal_chunk_x, input.portal_chunk_z, lut)) return;
 
         uint32_t output_index = atomicAdd(&outputs_count, 1);
         if (output_index < outputs_size) {
@@ -291,43 +420,9 @@ __global__ void filter_skip_second(DeviceOutputsPtr inputs) {
     }
 }
 
-#define cudaCheckError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
-   if (code != cudaSuccess) {
-      std::fprintf(stderr, "Cuda Error: %s %s %d\n", cudaGetErrorString(code), file, line);
-      if (abort) exit(code);
-   }
-}
-
 bool profiling = false;
 bool no_layouts = false;
-
-// constexpr uint32_t layout_thread_count = 12;
-// constexpr uint32_t thread_inputs_size = inputs_size / layout_thread_count;
-
-// InputChunkPos thread_inputs[layout_thread_count][thread_inputs_size];
-// uint64_t thread_inputs_count[layout_thread_count] = {};
-// std::thread layout_threads[layout_thread_count];
-
-// void start_layout_threads(uint32_t structure_seed_hi) {
-//     uint64_t full_structure_seed_start = (uint64_t)structure_seed_hi << 16;
-//     uint64_t full_structure_seed_count = 1 << 16;
-//     if (profiling) full_structure_seed_count /= 32;
-
-//     for (uint32_t i = 0; i < layout_thread_count; i++) {
-//         layout_threads[i] = std::thread([=](){
-//             uint64_t structure_seed_start = full_structure_seed_start + i * full_structure_seed_count / layout_thread_count;
-//             uint64_t structure_seed_end = full_structure_seed_start + (i + 1) * full_structure_seed_count / layout_thread_count;
-//             thread_inputs_count[i] = generate_layouts(structure_seed_start, structure_seed_end, thread_inputs[i], thread_inputs_size);
-//         });
-//     }
-// }
-
-// void join_layout_threads() {
-//     for (int i = 0; i < layout_thread_count; i++) {
-//         layout_threads[i].join();
-//     }
-// }
+void *device_skip_lut;
 
 struct LayoutThreadData {
     std::thread thread;
@@ -394,12 +489,14 @@ struct LayoutThreadPool {
     void copy_data() {
         if (state != LayoutThreadPoolState::HasData) throw std::runtime_error("Not HasData");
 
-        inputs_count = 0;
+        uint32_t total_count = 0;
         for (auto &thread_data : threads) {
             uint32_t count = thread_data.inputs.size();
-            cudaCheckError(cudaMemcpy(inputs + inputs_count, thread_data.inputs.data(), count * sizeof(inputs[0]), cudaMemcpyHostToDevice));
-            inputs_count += count;
+            cudaCheckError(cudaMemcpyAsync(inputs + total_count, thread_data.inputs.data(), count * sizeof(inputs[0]), cudaMemcpyHostToDevice));
+            total_count += count;
         }
+        cudaCheckError(cudaDeviceSynchronize());
+        inputs_count = total_count;
 
         // std::printf("inputs_count = %" PRIu32 "\n", inputs_count);
     }
@@ -414,8 +511,12 @@ enum class FilterType {
     Bloom,
 };
 
+cudaEvent_t event_start, event_end;
+
 void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_thread_pool, FilterType filter_type, DeviceBloomFilter bloom_filter, void *device_bloom_outputs, bool no_bloom_postfiler, cudaDeviceProp &prop) {
-    inputs_count = 0;
+    bool first = layout_thread_pool.get_state() == LayoutThreadPoolState::Empty;
+
+    if (first || !no_layouts) inputs_count = 0;
     outputs_count = 0;
     bloom_outputs_count = 0;
 
@@ -424,18 +525,20 @@ void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_th
     }
 
     if (layout_thread_pool.get_state() == LayoutThreadPoolState::Running) {
-        auto start = std::chrono::steady_clock::now();
+        // auto start = std::chrono::steady_clock::now();
 
         layout_thread_pool.join_layout_threads();
 
-        auto end = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1E-9;
-        if (elapsed > 0.005) {
-            printf("CPU Thread join took %.3f s\n", elapsed);
-        }
+        // auto end = std::chrono::steady_clock::now();
+        // double elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1E-9;
+        // if (elapsed > 0.005) {
+        //     printf("CPU Thread join took %.3f s\n", elapsed);
+        // }
     }
 
-    layout_thread_pool.copy_data();
+    if (first || !no_layouts) {
+        layout_thread_pool.copy_data();
+    }
 
     if (!no_layouts) {
         layout_thread_pool.start_layout_threads(structure_seed_hi + 1, superflat);
@@ -443,10 +546,12 @@ void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_th
 
     // printf("inputs_count = %" PRIu64 " invocations = %" PRIu64 "\n", inputs_count, inputs_count * COUNT16);
 
+    cudaCheckError(cudaEventRecord(event_start));
+
     uint32_t thread_count = inputs_count * (1 << 16);
     uint32_t block_count = thread_count / skip_threads_per_block;
     if (filter_type == FilterType::Skip) {
-        filter_skip<<<block_count, skip_threads_per_block>>>();
+        filter_skip<<<block_count, skip_threads_per_block>>>(device_skip_lut);
     } else {
         auto bloom_outputs = DeviceOutputsPtr((DeviceOutputsPtr::pointer)device_bloom_outputs);
         {
@@ -454,10 +559,10 @@ void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_th
             filter_bloom<<<block_count, bloom_threads_per_block>>>(bloom_filter, DeviceInputsPtr(inputs), bloom_outputs);
         }
         if (!no_bloom_postfiler) {
-            filter_skip_second<<<prop.multiProcessorCount * 16, skip_threads_per_block>>>(bloom_outputs);
+            filter_skip_second<<<prop.multiProcessorCount * 16, skip_threads_per_block>>>(bloom_outputs, device_skip_lut);
         }
     }
-    cudaCheckError(cudaPeekAtLastError());
+    cudaCheckError(cudaEventRecord(event_end));
     cudaCheckError(cudaDeviceSynchronize());
 
     if (filter_type == FilterType::Bloom && bloom_outputs_count >= bloom_outputs_size) {
@@ -471,73 +576,10 @@ void run(uint32_t structure_seed_hi, bool superflat, LayoutThreadPool &layout_th
     if (filter_type != FilterType::Bloom || !no_bloom_postfiler) {
         for (uint64_t i = 0; i < outputs_count; i++) {
             OutputChunkPos outputChunkPos = outputs[i];
-            // InputChunkPos inputChunkPos = inputs[outputChunkPos.input_index];
-            // int64_t world_seed = ((uint64_t)outputChunkPos.world_seed_hi << 48) | ((uint64_t)inputChunkPos.structure_seed_hi << 32) | structure_seed_lo;
-            // int64_t world_seed = ((uint64_t)outputChunkPos.world_seed_hi << 48) | inputChunkPos.structure_seed;
-            // int startChunkX = 0;
-            // int startChunkZ = 0;
-            // stronghold_generator::StrongholdGenerator::getFirstPosFast(world_seed, startChunkX, startChunkZ);
-            // printf("Seed: %lli Start: %i %i Pos: %i ~ %i\n", world_seed, startChunkX, startChunkZ, (int32_t)inputChunkPos.chunk_x << 4, (int32_t)inputChunkPos.chunk_z << 4);
             bool is_valid = superflat || test_world_seed(outputChunkPos.world_seed, outputChunkPos.start_chunk_x, outputChunkPos.start_chunk_z);
             std::printf("Seed: %" PRIi64 " Start: %i %i Pos: %i ~ %i Valid: %s\n", outputChunkPos.world_seed, outputChunkPos.start_chunk_x, outputChunkPos.start_chunk_z, outputChunkPos.portal_chunk_x << 4, outputChunkPos.portal_chunk_z << 4, is_valid ? "YES" : "no");
         }
     }
-}
-
-void precompute_bits(PrecompItem *table, unsigned int first, unsigned int count) {
-    for (uint64_t bits = 0; bits < ((uint64_t) 1 << count); bits++) {
-        uint64_t seed_lo = 0;
-        if (first < 64) seed_lo = bits << first;
-        uint64_t seed_hi = 0;
-        if (first + count > 64) {
-            if (first >= 64) seed_hi = bits << (first - 64);
-            else seed_hi = bits >> (64 - first);
-        }
-
-        XRSR128 rng;
-        xrsr128_init(&rng, 0, 0);
-        skip_cpu(&rng, seed_lo, seed_hi);
-        table[bits] = PrecompItem { { (uint32_t)rng.lo, (uint32_t)(rng.lo >> 32), (uint32_t)rng.hi, (uint32_t)(rng.hi >> 32) } };
-    }
-}
-
-template<typename T>
-void precompute_symbol(T &symbol, uint64_t offset, uint32_t first, uint32_t count) {
-    uint32_t table_size = 1 << count;
-    auto data = std::make_unique<PrecompItem[]>(table_size);
-    precompute_bits(data.get(), first, count);
-    PrecompItem *address = 0;
-    cudaCheckError(cudaGetSymbolAddress((void**) &address, symbol));
-    cudaCheckError(cudaMemcpyAsync(address + offset, data.get(), table_size * sizeof(data[0]), cudaMemcpyHostToDevice));
-}
-
-void precompute_skip() {
-    auto start = std::chrono::steady_clock::now();
-
-    precompute_symbol(precomp_global, 32 *  0,       0, 5);
-    precompute_symbol(precomp_global, 32 *  1,       5, 5);
-    precompute_symbol(precomp_global, 32 *  2,      10, 5);
-    precompute_symbol(precomp_global, 32 *  3,      15, 5);
-    precompute_symbol(precomp_global, 32 *  4,      20, 5);
-    precompute_symbol(precomp_global, 32 *  5,      25, 5);
-    precompute_symbol(precomp_global, 32 *  6, 32 +  0, 5);
-    precompute_symbol(precomp_global, 32 *  7, 32 +  5, 5);
-    precompute_symbol(precomp_global, 32 *  8, 32 + 10, 5);
-    precompute_symbol(precomp_global, 32 *  9, 32 + 15, 5);
-    precompute_symbol(precomp_global, 32 * 10, 32 + 20, 5);
-    precompute_symbol(precomp_global, 32 * 11, 32 + 25, 5);
-    precompute_symbol(precomp_global, 32 * 12, 64 +  0, 5);
-    precompute_symbol(precomp_global, 32 * 13, 64 +  5, 5);
-    precompute_symbol(precomp_global, 32 * 14, 64 + 10, 5);
-    precompute_symbol(precomp_global, 32 * 15, 64 + 15, 5);
-    precompute_symbol(precomp_global, 32 * 16, 64 + 20, 5);
-    precompute_symbol(precomp_global, 32 * 17, 64 + 25, 5);
-    precompute_symbol(precomp_global, 32 * 18, 96 +  0, 5);
-    precompute_symbol(precomp_global, 32 * 19, 96 +  5, 5);
-
-    auto end = std::chrono::steady_clock::now();
-    double delta = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count() * 1E-9;
-    // std::fprintf(stderr, "Precomputing done in %.2fs\n", delta);
 }
 
 void bench_layout() {
@@ -566,28 +608,8 @@ namespace KernelBruteforceDecorationSeeds {
     constexpr uint32_t threads_per_block = 256;
     constexpr uint32_t seeds_per_thread = 16;
 
-    __global__ void kernel(uint32_t hi) {
-        __shared__ Precomp precomp_shared;
-        copy_precomp(precomp_shared);
-        __syncthreads();
-
+    __global__ void kernel(uint32_t hi, void *lut) {
         uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-
-        // uint64_t decoration_seed = ((uint64_t)hi << 32) + index;
-        // XRSR128 rng;
-        // uint64_t feature_seed = decoration_seed + 40019;
-        // feature_seed ^= XRSR_SILVER_RATIO;
-        // rng.lo = mix64(feature_seed);
-        // rng.hi = mix64(feature_seed + XRSR_GOLDEN_RATIO);
-        // if (!test_seeded_decoration_seed(precomp_shared, rng)) return;
-
-        // uint64_t iter_seed = ((uint64_t)hi << 32) + index;
-        // XRSR128 rng;
-        // rng.lo = mix64(iter_seed);
-        // rng.hi = mix64(iter_seed + XRSR_GOLDEN_RATIO);
-        // if (!test_seeded_decoration_seed(precomp_shared, rng)) return;
-
-        // uint32_t output_index = atomicAdd(&outputs_count, 1);
 
         uint64_t iter_seed = ((uint64_t)hi << 32) + index * XRSR_GOLDEN_RATIO;
         uint64_t prev_mix = mix64(iter_seed);
@@ -598,7 +620,10 @@ namespace KernelBruteforceDecorationSeeds {
             rng.lo = prev_mix;
             rng.hi = next_mix;
             prev_mix = next_mix;
-            if (!test_seeded_decoration_seed(precomp_shared, rng)) continue;
+
+            rng = decoration_chunked_skip.apply(rng, lut);
+
+            if (!test_12_eyes(rng, lut)) continue;
 
             uint32_t output_index = atomicAdd(&outputs_count, 1);
         }
@@ -606,15 +631,22 @@ namespace KernelBruteforceDecorationSeeds {
 }
 
 void bench_decoration(uint32_t print_interval) {
+    void *lut = decoration_chunked_skip.generate_lut();
+
+    cudaFuncAttributes attr;
+    cudaCheckError(cudaFuncGetAttributes(&attr, KernelBruteforceDecorationSeeds::kernel));
+    std::fprintf(stderr, "preferredShmemCarveout = %d\n", attr.preferredShmemCarveout);
+    std::fprintf(stderr, "sharedSizeBytes = %zu\n", attr.sharedSizeBytes);
+
     auto time_start = std::chrono::steady_clock::now();
     uint64_t total_inputs = 0;
 
     for (uint32_t iter = 0;; iter++) {
         uint64_t seeds_per_run = UINT64_C(1) << 32;
+        if (profiling) seeds_per_run /= 32;
         uint64_t threads_per_run = seeds_per_run / KernelBruteforceDecorationSeeds::seeds_per_thread;
         uint32_t blocks_per_run = threads_per_run / KernelBruteforceDecorationSeeds::threads_per_block;
-        KernelBruteforceDecorationSeeds::kernel<<<blocks_per_run, KernelBruteforceDecorationSeeds::threads_per_block>>>(iter * XRSR_GOLDEN_RATIO);
-        cudaCheckError(cudaPeekAtLastError());
+        KernelBruteforceDecorationSeeds::kernel<<<blocks_per_run, KernelBruteforceDecorationSeeds::threads_per_block>>>(iter * XRSR_GOLDEN_RATIO, lut);
         cudaCheckError(cudaDeviceSynchronize());
 
         total_inputs += seeds_per_run;
@@ -632,6 +664,8 @@ void bench_decoration(uint32_t print_interval) {
             time_start = time_end;
         }
     }
+
+    cudaCheckError(cudaFree(lut));
 }
 
 std::vector<uint64_t> generate_random_decoration_seeds() {
@@ -786,6 +820,9 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    int device = 0;
+    cudaCheckError(cudaSetDevice(device));
+
     if (run_bench_decoration) {
         bench_decoration(print_interval);
         return 0;
@@ -816,20 +853,22 @@ int main(int argc, char **argv) {
     std::fprintf(stderr, "set_persisting_limit = %s\n", set_persisting_limit ? "true" : "false");
     std::fprintf(stderr, "clear_persisting = %s\n", reset_persisting ? "true" : "false");
 
-    int device = 0;
-    cudaCheckError(cudaSetDevice(device));
-
     cudaDeviceProp prop;
     cudaCheckError(cudaGetDeviceProperties(&prop, device));
     std::fprintf(stderr, "l2CacheSize = %d\n", prop.l2CacheSize);
     std::fprintf(stderr, "persistingL2CacheMaxSize = %d\n", prop.persistingL2CacheMaxSize);
     std::fprintf(stderr, "accessPolicyMaxWindowSize = %d\n", prop.accessPolicyMaxWindowSize);
+    std::fprintf(stderr, "sharedMemPerMultiprocessor = %zu\n", prop.sharedMemPerMultiprocessor);
     std::fprintf(stderr, "sharedMemPerBlock = %zu\n", prop.sharedMemPerBlock);
     std::fprintf(stderr, "multiProcessorCount = %d\n", prop.multiProcessorCount);
 
     size_t persistingL2CacheSize;
     cudaCheckError(cudaDeviceGetLimit(&persistingL2CacheSize, cudaLimitPersistingL2CacheSize));
     std::fprintf(stderr, "persistingL2CacheSize = %zu\n", persistingL2CacheSize);
+
+    device_skip_lut = skip_chunked_skip.generate_lut();
+    // cudaCheckError(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
+    // cudaCheckError(cudaFuncSetAttribute(filter_skip, cudaFuncAttributePreferredSharedMemoryCarveout, 0));
 
     // size_t bloom_filter_size = floor_pow2(std::min(std::min(128 * 1024 * 1024, (int)(prop.l2CacheSize * 0.75)), std::min(prop.persistingL2CacheMaxSize, prop.accessPolicyMaxWindowSize)) / 8 * 8);
     size_t bloom_filter_size = floor_pow2(std::min(128 * 1024 * 1024, (int)(prop.l2CacheSize * 0.75)));
@@ -845,23 +884,11 @@ int main(int argc, char **argv) {
     DeviceBloomFilter device_bloom_filter;
     HostBloomFilters host_bloom_filters;
 
-    precompute_skip();
-
     if (filter_type == FilterType::Bloom) {
         cudaCheckError(cudaMalloc(&device_bloom_filter_data, bloom_filter_size));
         cudaCheckError(cudaMalloc(&device_bloom_outputs, 1024 * 1024 * 1024));
 
         device_bloom_filter = DeviceBloomFilter(reinterpret_cast<uint32_t*>(device_bloom_filter_data), bloom_filter_size);
-
-        // cudaCheckError(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, bloom_size));
-
-        // cudaStreamAttrValue stream_attribute;                                                       // Stream level attributes data structure
-        // stream_attribute.accessPolicyWindow.base_ptr  = bloom_device;                               // Global Memory data pointer
-        // stream_attribute.accessPolicyWindow.num_bytes = bloom_size;                                 // Number of bytes for persistence access
-        // stream_attribute.accessPolicyWindow.hitRatio  = 1.0;                                        // Hint for cache hit ratio
-        // stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;               // Persistence Property
-        // stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-        // cudaStreamSetAttribute(cudaStreamLegacy, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
 
         auto seeds = generate_random_decoration_seeds();
         host_bloom_filters = generate_bloom_filters(seeds, bloom_filter_size);
@@ -869,23 +896,14 @@ int main(int argc, char **argv) {
 
     LayoutThreadPool layout_thread_pool(threads);
 
-    // cudaDeviceProp prop;
-    // cudaGetDeviceProperties_v2(&prop, 0);
-    // std::printf("prop.sharedMemPerBlock = %zu\n", prop.sharedMemPerBlock);
-    // std::printf("prop.sharedMemPerMultiprocessor = %zu\n", prop.sharedMemPerMultiprocessor);
-    // std::printf("prop.sharedMemPerBlockOptin = %zu\n", prop.sharedMemPerBlockOptin);
-
-    // cudaCheckError(cudaFuncSetAttribute(filter, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
-    // cudaFuncAttributes attr;
-    // cudaCheckError(cudaFuncGetAttributes(&attr, filter));
-    // std::printf("attr.sharedSizeBytes = %zu\n", attr.sharedSizeBytes);
-    // std::printf("attr.constSizeBytes = %zu\n", attr.constSizeBytes);
-    // std::printf("attr.localSizeBytes = %zu\n", attr.localSizeBytes);
+    cudaCheckError(cudaEventCreate(&event_start));
+    cudaCheckError(cudaEventCreate(&event_end));
 
     auto time_start = std::chrono::steady_clock::now();
 
     uint64_t total_inputs_count = 0;
     uint64_t total_bloom_outputs_count = 0;
+    double total_kernel_time = 0;
 
     for (uint32_t iter = 0;; iter++) {
         uint32_t structure_seed_hi = start + iter;
@@ -899,6 +917,9 @@ int main(int argc, char **argv) {
         structure_seed_hi += 1;
         total_inputs_count += inputs_count;
         total_bloom_outputs_count += bloom_outputs_count;
+        float kernel_elapsed;
+        cudaCheckError(cudaEventElapsedTime(&kernel_elapsed, event_start, event_end));
+        total_kernel_time += kernel_elapsed;
 
         if (print_interval != 0 && (iter + 1) % print_interval == 0) {
             auto time_end = std::chrono::steady_clock::now();
@@ -906,27 +927,34 @@ int main(int argc, char **argv) {
             uint64_t seeds_per_run = UINT64_C(1) << 32;
             double sps = print_interval * seeds_per_run / delta;
             uint64_t total_gpu_seeds = total_inputs_count * 65536;
-            std::fprintf(stderr, "%" PRIu32 " | %.2f Gsps | %.2f h | GPU %.2f Gsps | 1 in %.2f\n",
+            std::fprintf(stderr, "%" PRIu32 " | %.2f Gsps | %.2f h | GPU %.2f Gsps | 1 in %.2f | %3.2f %%\n",
                 structure_seed_hi,
                 sps * 1E-9,
                 (end - structure_seed_hi) * seeds_per_run / sps / 3600,
                 total_gpu_seeds / delta * 1e-9,
-                (double)total_gpu_seeds / total_bloom_outputs_count
+                (double)total_gpu_seeds / total_bloom_outputs_count,
+                total_kernel_time * 1e-3 / delta * 1e2
             );
             total_inputs_count = 0;
             total_bloom_outputs_count = 0;
+            total_kernel_time = 0;
             time_start = time_end;
         }
 
         if (structure_seed_hi == end) break;
     }
 
+    if (device_skip_lut) {
+        cudaCheckError(cudaFree(device_skip_lut));
+    }
     if (device_bloom_filter_data) {
         cudaCheckError(cudaFree(device_bloom_filter_data));
     }
     if (device_bloom_outputs) {
-        cudaCheckError(cudaFree(device_bloom_filter_data));
+        cudaCheckError(cudaFree(device_bloom_outputs));
     }
+    cudaCheckError(cudaEventDestroy(event_start));
+    cudaCheckError(cudaEventDestroy(event_end));
 
     return 0;
 }
